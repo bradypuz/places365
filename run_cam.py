@@ -2,10 +2,11 @@
 # by Bolei Zhou, sep 2, 2017
 
 import torch
-from torch.autograd import Variable as V
+from torch.autograd import Variable as Variable
 import torchvision.models as models
 import torchvision.datasets as dset
 from torchvision import transforms as transforms
+from torchvision.utils import save_image
 from torch.nn import functional as F
 import os
 import numpy as np
@@ -15,6 +16,7 @@ from PIL import Image
 from functools import partial
 import pickle
 import argparse
+import time
 
 def load_labels():
     # prepare all the labels
@@ -61,18 +63,23 @@ def load_labels():
 def hook_feature(module, input, output):
     features_blobs.append(np.squeeze(output.data.cpu().numpy()))
 
-def returnCAM(feature_conv, weight_softmax, class_idx):
-    # generate the class activation maps upsample to 256x256
-    size_upsample = (256, 256)
-    nc, h, w = feature_conv.shape
+def returnCAM(feature_conv, weight_softmax, class_idx_lists):
+    # generate the class activation maps upsample to imageSize*imageSize
+    size_upsample = (opt.imageSize, opt.imageSize)
+    bs, nc, h, w = feature_conv.shape
     output_cam = []
-    for idx in class_idx:
-        cam = weight_softmax[class_idx].dot(feature_conv.reshape((nc, h*w)))
-        cam = cam.reshape(h, w)
-        cam = cam - np.min(cam)
-        cam_img = cam / np.max(cam)
-        cam_img = np.uint8(255 * cam_img)
-        output_cam.append(imresize(cam_img, size_upsample))
+    for class_idx_list in class_idx_lists:
+        cam_img_list = []
+        for iImg in range(bs):
+            iClass = class_idx_list[iImg]
+            cam = weight_softmax[iClass].dot(feature_conv[iImg, :, :, :].reshape((nc, h*w)))
+            cam = cam.reshape(h, w)
+            cam = cam - np.min(cam)
+            cam_img = cam / np.max(cam) #normalize to [0, 1]
+            cam_img = np.uint8(255 * cam_img)
+            cam_img_list.append(imresize(cam_img, size_upsample))
+
+        output_cam.append(cam_img_list)
     return output_cam
 
 def returnTF():
@@ -113,6 +120,7 @@ def load_model():
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', required=True, help='cifar10 | lsun | imagenet | folder | lfw | fake')
 parser.add_argument('--dataroot', required=True, help='path to dataset')
+parser.add_argument('--workers', type=int, help='number of data loading workers', default=2)
 parser.add_argument('--batchSize', type=int, default=64, help='input batch size')
 parser.add_argument('--imageSize', type=int, default=64, help='the height / width of the input image to network')
 parser.add_argument('--cuda', action='store_true', help='enables cuda')
@@ -162,45 +170,73 @@ elif opt.dataset == 'fake':
                             transform=transforms.ToTensor())
 assert dataset
 dataloader = torch.utils.data.DataLoader(dataset, batch_size=opt.batchSize,
-shuffle=True, num_workers=int(opt.workers))
+                                         shuffle=False, num_workers=int(opt.workers))
 
 ngpu = int(opt.ngpu)
 nc = 3
 
+input = torch.FloatTensor(opt.batchSize, 3, opt.imageSize, opt.imageSize)
 
-# load the labels
-# classes, labels_IO, labels_attribute, W_attribute = load_labels()
+if opt.cuda:
+    input = input.cuda()
 
 # load the model
 features_blobs = []
 model = load_model()
-
-# load the transformer
-tf = returnTF() # image transformer
 
 # get the softmax weight
 params = list(model.parameters())
 weight_softmax = params[-2].data.numpy()
 weight_softmax[weight_softmax<0] = 0
 
-# load the test image
-# img_url = 'http://places2.csail.mit.edu/imgs/12.jpg'
-# os.system('wget %s -q -O test.jpg' % img_url)
-img = Image.open('sky.jpg')
-input_img = V(tf(img).unsqueeze(0), volatile=True)
+mean_gaussian = (128,128,128)
+sd_gaussian = (64,64,64)
+# cv2.imwrite('%s/gaussian.jpg' % opt.outf, gaussian_img)
 
-# forward pass
-logit = model.forward(input_img)
-h_x = F.softmax(logit).data.squeeze()
-probs, idx = h_x.sort(0, True)
+img_names = dataloader.dataset.imgs
 
-# generate class activation mapping
-print ('Class activation map is saved as cam.jpg')
-CAMs = returnCAM(features_blobs[0], weight_softmax, [idx[0]])
+for i, data in enumerate(dataloader, 0):
+    imgs_A, _ = data
+    batch_size = imgs_A.size(0)
+    if opt.cuda:
+        imgs_A = imgs_A.cuda()
+    input.resize_as_(imgs_A).copy_(imgs_A)
+    inputv = Variable(input, volatile=True)
 
-# render the CAM and output
-img = cv2.imread('sky.jpg')
-height, width, _ = img.shape
-heatmap = cv2.applyColorMap(cv2.resize(CAMs[0],(width, height)), cv2.COLORMAP_JET)
-result = heatmap * 0.4 + img * 0.5
-cv2.imwrite('cam.jpg', result)
+    logit = model(inputv)
+    h_x = F.softmax(logit).data.squeeze()
+    probs, idx = h_x.sort(1, True)
+    CAMs = returnCAM(features_blobs[0], weight_softmax, [idx[:, 0]])
+    del features_blobs[:]
+
+    #Blend the original images and gaussian noise images using CAM as weights
+    nClass = len(CAMs)
+    nImg = len(CAMs[0])
+
+
+
+    for iClass in range(nClass):
+        for iImg in range(nImg):
+            #generate a gaussian noise image
+            gaussian_img = np.zeros((opt.imageSize, opt.imageSize, 3), np.float)
+            cv2.randn(gaussian_img, mean_gaussian, sd_gaussian)
+
+            image_path, image_name = os.path.split(img_names[i * batch_size + iImg][0])
+            _, dir = os.path.split(image_path)
+            print('Processing: %d / %d' %(i * batch_size + iImg, len(img_names)))
+            try:
+                os.makedirs('%s/%s' % (opt.outf, dir))
+            except OSError:
+                pass
+
+            alpha_mask =  (CAMs[iClass][iImg]).astype(float)/255
+            alpha_mask = cv2.merge((alpha_mask,alpha_mask, alpha_mask))
+            torch_img = imgs_A[iImg].numpy().astype(float)
+            cv_img = cv2.merge((torch_img[2, :, :], torch_img[1, : ,:] , torch_img[0,:,:])) #RGB -> BGR
+            cv_img = (cv_img + 1.0) * 255.0 / 2.0
+            out_img = cv2.multiply(alpha_mask, cv_img)
+            out_img_with_noise = out_img + cv2.multiply(1.0-alpha_mask, gaussian_img)
+            # out_img = cv2.multiply(imgs_A[iImg].numpy().astype(float), alpha_mask)
+            im_AB = np.concatenate([cv_img, out_img_with_noise], 1)
+            cv2.imwrite('%s/%s/%s' % (opt.outf, dir, image_name), np.uint8(im_AB))
+
