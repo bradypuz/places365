@@ -65,7 +65,7 @@ logit = model.forward(input_img)
 h_x = F.softmax(logit).data.squeeze()
 probs, idx = h_x.sort(0, True)
 
-print 'RESULT ON ' + img_url
+print ('RESULT ON ' + img_url)
 # output the prediction
 for i in range(0, 5):
     print('{:.3f} -> {}'.format(probs[i], classes[idx[i]]))

@@ -4,7 +4,8 @@
 import torch
 from torch.autograd import Variable as V
 import torchvision.models as models
-from torchvision import transforms as trn
+import torchvision.datasets as dset
+from torchvision import transforms as transforms
 from torch.nn import functional as F
 import os
 import numpy as np
@@ -13,7 +14,7 @@ import cv2
 from PIL import Image
 from functools import partial
 import pickle
-
+import argparse
 
 def load_labels():
     # prepare all the labels
@@ -76,10 +77,10 @@ def returnCAM(feature_conv, weight_softmax, class_idx):
 
 def returnTF():
 # load the image transformer
-    tf = trn.Compose([
-        trn.Scale((224,224)),
-        trn.ToTensor(),
-        trn.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    tf = transforms.Compose([
+        transforms.Scale((224,224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     return tf
 
@@ -94,30 +95,81 @@ def load_model():
     if not os.access(model_file, os.W_OK):
         os.system('wget http://places2.csail.mit.edu/models_places365/' + model_file)
         os.system('wget https://raw.githubusercontent.com/csailvision/places365/master/wideresnet.py')
-    useGPU = 0
+    useGPU = 1
     if useGPU == 1:
         model = torch.load(model_file)
     else:
         model = torch.load(model_file, map_location=lambda storage, loc: storage) # allow cpu
 
-    ## if you encounter the UnicodeDecodeError when use python3 to load the model, add the following line will fix it. Thanks to @soravux
-    # from functools import partial
-    # import pickle
-    # pickle.load = partial(pickle.load, encoding="latin1")
-    # pickle.Unpickler = partial(pickle.Unpickler, encoding="latin1")
-    # model = torch.load(model_file, map_location=lambda storage, loc: storage, pickle_module=pickle)
-
     model.eval()
     print(model)
     # hook the feature extractor
-    features_names = ['layer4','avgpool'] # this is the last conv layer of the resnet
+    features_names = ['layer4'] # this is the last conv layer of the resnet
     for name in features_names:
         model._modules.get(name).register_forward_hook(hook_feature)
     return model
 
+#arguments
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset', required=True, help='cifar10 | lsun | imagenet | folder | lfw | fake')
+parser.add_argument('--dataroot', required=True, help='path to dataset')
+parser.add_argument('--batchSize', type=int, default=64, help='input batch size')
+parser.add_argument('--imageSize', type=int, default=64, help='the height / width of the input image to network')
+parser.add_argument('--cuda', action='store_true', help='enables cuda')
+parser.add_argument('--ngpu', type=int, default=1, help='number of GPUs to use')
+parser.add_argument('--nc', type=int, default=3, help='number of image channels')
+parser.add_argument('--outf', default='.', help='folder to output images and model checkpoints')
+
+
+opt = parser.parse_args()
+print(opt)
+
+try:
+    os.makedirs(opt.outf)
+except OSError:
+    pass
+
+#dataloader
+if torch.cuda.is_available() and not opt.cuda:
+    print("WARNING: You have a CUDA device, so you should probably run with --cuda")
+
+if opt.dataset in ['imagenet', 'folder', 'lfw']:
+    # folder dataset
+    dataset = dset.ImageFolder(root=opt.dataroot,
+                               transform=transforms.Compose([
+                                   transforms.Scale(opt.imageSize),
+                                   transforms.CenterCrop(opt.imageSize),
+                                   transforms.ToTensor(),
+                                   transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                               ]))
+elif opt.dataset == 'lsun':
+    dataset = dset.LSUN(db_path=opt.dataroot, classes=['bedroom_train'],
+                        transform=transforms.Compose([
+                            transforms.Scale(opt.imageSize),
+                            transforms.CenterCrop(opt.imageSize),
+                            transforms.ToTensor(),
+                            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                        ]))
+elif opt.dataset == 'cifar10':
+    dataset = dset.CIFAR10(root=opt.dataroot, download=True,
+                           transform=transforms.Compose([
+                               transforms.Scale(opt.imageSize),
+                               transforms.ToTensor(),
+                               transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                           ]))
+elif opt.dataset == 'fake':
+    dataset = dset.FakeData(image_size=(3, opt.imageSize, opt.imageSize),
+                            transform=transforms.ToTensor())
+assert dataset
+dataloader = torch.utils.data.DataLoader(dataset, batch_size=opt.batchSize,
+shuffle=True, num_workers=int(opt.workers))
+
+ngpu = int(opt.ngpu)
+nc = 3
+
 
 # load the labels
-classes, labels_IO, labels_attribute, W_attribute = load_labels()
+# classes, labels_IO, labels_attribute, W_attribute = load_labels()
 
 # load the model
 features_blobs = []
@@ -132,9 +184,9 @@ weight_softmax = params[-2].data.numpy()
 weight_softmax[weight_softmax<0] = 0
 
 # load the test image
-img_url = 'http://places2.csail.mit.edu/imgs/12.jpg'
-os.system('wget %s -q -O test.jpg' % img_url)
-img = Image.open('test.jpg')
+# img_url = 'http://places2.csail.mit.edu/imgs/12.jpg'
+# os.system('wget %s -q -O test.jpg' % img_url)
+img = Image.open('sky.jpg')
 input_img = V(tf(img).unsqueeze(0), volatile=True)
 
 # forward pass
@@ -142,33 +194,12 @@ logit = model.forward(input_img)
 h_x = F.softmax(logit).data.squeeze()
 probs, idx = h_x.sort(0, True)
 
-print ('RESULT ON ' + img_url)
-
-# output the IO prediction
-io_image = np.mean(labels_IO[idx[:10].numpy()]) # vote for the indoor or outdoor
-if io_image < 0.5:
-    print ('--TYPE OF ENVIRONMENT: indoor')
-else:
-    print ('--TYPE OF ENVIRONMENT: outdoor')
-
-# output the prediction of scene category
-print ('--SCENE CATEGORIES:')
-for i in range(0, 5):
-    print('{:.3f} -> {}'.format(probs[i], classes[idx[i]]))
-
-# output the scene attributes
-responses_attribute = W_attribute.dot(features_blobs[1])
-idx_a = np.argsort(responses_attribute)
-print ('--SCENE ATTRIBUTES:')
-print (', '.join([labels_attribute[idx_a[i]] for i in range(-1,-10,-1)]))
-
-
 # generate class activation mapping
 print ('Class activation map is saved as cam.jpg')
 CAMs = returnCAM(features_blobs[0], weight_softmax, [idx[0]])
 
 # render the CAM and output
-img = cv2.imread('test.jpg')
+img = cv2.imread('sky.jpg')
 height, width, _ = img.shape
 heatmap = cv2.applyColorMap(cv2.resize(CAMs[0],(width, height)), cv2.COLORMAP_JET)
 result = heatmap * 0.4 + img * 0.5
